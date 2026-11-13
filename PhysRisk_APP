@@ -1,0 +1,115 @@
+# OS-Climate physrisk hazard viewer.  Run: shiny::runApp("app.R")   (inventory.json is downloaded on first run)
+# packages: shiny, leaflet, terra, jsonlite, curl (CRAN);  Rarr (BiocManager::install("Rarr"))
+suppressPackageStartupMessages({ library(shiny); library(leaflet); library(terra); library(jsonlite); library(curl); library(Rarr) })
+
+BASE  <- "https://os-climate-physical-risk.s3.amazonaws.com/hazard-indicators/hazard.zarr"
+CACHE <- "physrisk_cache"
+INVENTORY <- "https://raw.githubusercontent.com/os-climate/physrisk/main/src/physrisk/data/static/hazard/inventory.json"
+MAX_MB <- 1000; MAX_PIX <- 4096; RM <- 6378137
+PALETTES <- list(flare   = c("#EDB081", "#E9955E", "#E27A5A", "#D5605B", "#C24E66", "#A94372", "#8B3D78", "#6C3A75"),
+                 heating = c("#FFF7BC", "#FEE391", "#FEC44F", "#FE9929", "#EC7014", "#CC4C02", "#993404", "#662506"))
+
+h <- new_handle()                                   # company proxy with Windows login, if there is one
+if (.Platform$OS.type == "windows") {
+  p <- curl::ie_get_proxy_for_url(BASE)
+  if (length(p) && nzchar(p[1])) h <- new_handle(proxy = sub("^https?://", "", p[1]), proxyuserpwd = ":", proxyauth = 12L)
+}
+
+fetch <- function(key) {                            # download one file into the cache; TRUE = exists
+  dest <- file.path(CACHE, key)
+  if (!file.exists(dest)) {
+    dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+    r <- curl_fetch_disk(paste(BASE, key, sep = "/"), paste0(dest, ".part"), handle = h)
+    if (r$status_code == 200) file.rename(paste0(dest, ".part"), dest) else unlink(paste0(dest, ".part"))
+    if (!r$status_code %in% c(200, 404)) stop("HTTP ", r$status_code, " for ", key)
+  }
+  file.exists(dest)
+}
+
+memo <- new.env()
+meta <- function(path) {                            # array metadata, cached
+  if (!is.null(memo[[path]])) return(memo[[path]])
+  if (!fetch(paste0(path, "/.zarray"))) stop("not in bucket: ", path)
+  fetch(paste0(path, "/.zattrs"))
+  za <- fromJSON(file.path(CACHE, path, ".zarray")); at <- fromJSON(file.path(CACHE, path, ".zattrs"))
+  memo[[path]] <- list(path = path, dir = file.path(CACHE, path), shape = za$shape, chunks = za$chunks, t = at$transform_mat3x3,
+                       crs = if (is.null(at$crs)) "EPSG:4326" else at$crs,
+                       sep = if (is.null(za$dimension_separator)) "." else za$dimension_separator,
+                       chunk_mb = prod(za$chunks) * 4 / 2^20)
+}
+
+read_view <- function(m, bbox, layer, progress) {   # last layer of a box in the array's CRS -> SpatRaster
+  t <- m$t
+  c0 <- max(floor((bbox[1] - t[3]) / t[1]), 0); c1 <- min(max(ceiling((bbox[3] - t[3]) / t[1]), c0 + 1), m$shape[3])
+  r0 <- max(floor((bbox[4] - t[6]) / t[5]), 0); r1 <- min(max(ceiling((bbox[2] - t[6]) / t[5]), r0 + 1), m$shape[2])
+  if (c1 <= c0 || r1 <= r0) stop("outside the data grid")
+  by <- max(1, ceiling(max(r1 - r0, c1 - c0) / MAX_PIX))
+  keys <- apply(expand.grid((layer - 1) %/% m$chunks[1], seq(r0 %/% m$chunks[2], (r1 - 1) %/% m$chunks[2]),
+                            seq(c0 %/% m$chunks[3], (c1 - 1) %/% m$chunks[3])), 1, paste, collapse = m$sep)
+  if (length(keys) * m$chunk_mb > MAX_MB) stop("zoom in - this view is too large to load")
+  for (i in seq_along(keys)) { progress(i / length(keys)); fetch(paste0(m$path, "/", keys[i])) }
+  rows <- seq(r0 + 1, r1, by = by); cols <- seq(c0 + 1, c1, by = by)
+  a <- read_zarr_array(m$dir, index = list(layer, rows, cols))
+  rast(matrix(a[1, , ], length(rows), length(cols)), crs = m$crs,
+       extent = ext(t[3] + c0 * t[1], t[3] + (c0 + by * length(cols)) * t[1], t[6] + (r0 + by * length(rows)) * t[5], t[6] + r0 * t[5]))
+}
+
+merc <- function(lon, lat) { lat <- pmin(pmax(lat, -85.05), 85.05); c(RM * lon * pi / 180, RM * log(tan(pi / 4 + lat * pi / 360))) }
+fill <- function(s, v) { for (n in names(v)) s <- gsub(paste0("\\{", n, "\\}"), v[[n]], s); s }
+levels_of <- local({ L <- new.env(); function(mp) { if (is.null(L[[mp]])) L[[mp]] <- Filter(function(z) fetch(sprintf("%s/%d/.zarray", mp, z)), 1:12); L[[mp]] } })
+
+if (!file.exists("inventory.json")) curl_download(INVENTORY, "inventory.json", handle = h)
+INV <- Filter(function(r) !is.null(r$map$path), fromJSON("inventory.json", simplifyVector = FALSE)$resources)
+for (i in seq_along(INV)) INV[[i]]$hazard_label <- gsub("([a-z])([A-Z])", "\\1 \\L\\2", INV[[i]]$hazard_type, perl = TRUE)
+
+ui <- fluidPage(
+  tags$head(tags$style("#map {height: calc(100vh - 110px) !important;} .form-group {margin-bottom: 4px}")),
+  fluidRow(column(2, selectInput("hazard", "Hazard type", sort(unique(vapply(INV, `[[`, "", "hazard_label"))))),
+           column(4, selectInput("indicator", "Hazard indicator", NULL)),
+           column(3, uiOutput("params")),
+           column(2, selectInput("scenario", "Scenario", NULL)),
+           column(1, selectInput("year", "Year", NULL))),
+  leafletOutput("map")
+)
+
+server <- function(input, output, session) {
+  of_type <- reactive(Filter(function(r) r$hazard_label == input$hazard, INV))
+  observe({ o <- of_type(); updateSelectInput(session, "indicator", choices = setNames(seq_along(o), vapply(o, `[[`, "", "display_name"))) })
+  res <- reactive({ o <- of_type(); i <- suppressWarnings(as.integer(input$indicator)); req(!is.na(i), i <= length(o)); o[[i]] })
+  output$params <- renderUI(lapply(names(res()$params), function(n) selectInput(paste0("par_", n), n, unlist(res()$params[[n]]))))
+  observe(updateSelectInput(session, "scenario", choices = vapply(res()$scenarios, `[[`, "", "id")))
+  observe({ sc <- Filter(function(s) s$id == input$scenario, res()$scenarios); req(length(sc) == 1)
+  updateSelectInput(session, "year", choices = unlist(sc[[1]]$years)) })
+  vals <- reactive({ v <- list(scenario = req(input$scenario), year = req(input$year))
+  for (n in names(res()$params)) v[[n]] <- req(input[[paste0("par_", n)]]); v })
+  
+  output$map <- renderLeaflet(
+    leaflet() |> addTiles() |> addMapPane("labels", zIndex = 450) |>
+      addTiles() |> setView(10, 30, zoom = 2))
+  view <- debounce(reactive(list(b = input$map_bounds, z = input$map_zoom)), 700)
+  
+  observe({
+    r <- res(); v <- view(); b <- v$b; req(b, v$z)
+    mp <- fill(r$map$path, vals()); cm <- r$map$colormap
+    x <- tryCatch(withProgress(message = "loading", value = 0, {
+      if (identical(r$map$source, "map_array_pyramid")) {
+        lv <- levels_of(mp); if (!length(lv)) stop("map not found: ", mp)
+        m <- meta(paste0(mp, "/", max(min(round(v$z) + 1, max(lv)), min(lv))))      # level = zoom + 1, as the online viewer
+      } else m <- meta(mp)
+      bb <- if (grepl("3857", m$crs)) c(merc(max(b$west, -180), max(b$south, -85)), merc(min(b$east, 180), min(b$north, 85)))
+      else c(max(b$west, -180), max(b$south, -90), min(b$east, 180), min(b$north, 90))
+      x <- read_view(m, bb, m$shape[1], function(p) setProgress(p))                   # last index (highest return period / threshold)
+      ifel(is.finite(x) & x != 0, x, NA)
+    }), error = function(e) e)
+    proxy <- leafletProxy("map") |> clearImages() |> clearControls()
+    if (inherits(x, "error")) { showNotification(conditionMessage(x), type = "warning", duration = 4); return() }
+    if (all(is.na(values(x)))) return()
+    pal <- colorNumeric(PALETTES[[if (is.null(PALETTES[[cm$name]])) "flare" else cm$name]], c(cm$min_value, cm$max_value), na.color = "transparent")
+    proxy |> addRasterImage(clamp(x, cm$min_value, cm$max_value, values = TRUE), colors = pal, opacity = 0.7, layerId = "hazard",
+                            project = !grepl("3857", crs(x, proj = TRUE)), maxBytes = 64 * 1024^2) |>
+      addLegend("bottomright", pal = pal, values = c(cm$min_value, cm$max_value), bins = 5, opacity = 0.9,
+                title = paste0(fill(r$display_name, vals()), "<br>", r$units), labFormat = labelFormat(digits = 3))
+  })
+}
+
+shinyApp(ui, server)
