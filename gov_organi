@@ -1,0 +1,203 @@
+##### 3.7) Board organigram #####
+# Needs Iss_Gov_Dir_Gen (one row per director). Run after the governance score script,
+# then the total score is shown in the company box as well.
+
+library(dplyr)
+library(htmltools)
+
+# ---- COLUMNS ---------------------------------------------------------------------
+# name and role are guessed from the column names. If a guess is wrong, write the
+# column name in here by hand, e.g. org_cols$name <- "fullname"
+org_guess <- function(pattern, exclude = "issuer|company|committee") {
+  nm <- names(Iss_Gov_Dir_Gen)
+  nm <- nm[grepl(pattern, nm, ignore.case = TRUE) & !grepl(exclude, nm, ignore.case = TRUE)]
+  nm <- nm[vapply(nm, function(v) !is.numeric(Iss_Gov_Dir_Gen[[v]]), logical(1))]
+  if (length(nm) == 0) return(NA_character_)
+  nm[which.max(vapply(nm, function(v) n_distinct(Iss_Gov_Dir_Gen[[v]]), numeric(1)))]
+}
+
+org_cols <- list(
+  name   = org_guess("name", "issuer|company|committee|first|last|given|middle|sur|family|vor|nach"),  # director name
+  first  = org_guess("^first|^given|vorname"),                   # only used if there is no full name
+  last   = org_guess("^last|^sur|^family|nachname"),
+  role   = org_guess("role|title|position|function"),            # e.g. Chair, CEO, Lead Director
+  group  = "dirclassificationpas",                               # columns of the organigram
+  age    = "age",
+  gender = "gender",
+  tenure = "tenure"
+)
+
+# Yes/No columns shown as small tags on the director card
+org_flags <- c(isdisclosedasfinancialexpert     = "Financial expert",
+               isformernoninterimceo            = "Former CEO",
+               isformeremployee                 = "Former employee",
+               providesprofservice              = "Provides prof. services",
+               hasrelativeincompservingasexec   = "Relative is executive",
+               hasboardinterlockrelwithcompexec = "Board interlock")
+
+# ---- HELPERS ---------------------------------------------------------------------
+org_yes <- function(x) {
+  if (is.numeric(x) || is.logical(x)) return(!is.na(x) & as.numeric(x) == 1)
+  tolower(trimws(as.character(x))) %in% c("yes", "y", "true", "1")
+}
+
+org_gender <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  case_when(is.na(x) | y == ""                  ~ NA_character_,
+            substr(y, 1, 1) %in% c("f", "w")    ~ "Female",
+            substr(y, 1, 1) == "m"              ~ "Male",
+            TRUE                                ~ as.character(x))
+}
+
+# executives first, independent directors last
+org_group_rank <- function(x) {
+  y <- tolower(x)
+  case_when(grepl("indep", y) & !grepl("non|not", y)       ~ 3,
+            grepl("insider|^exec", y)                      ~ 1,
+            TRUE                                           ~ 2)
+}
+
+org_initials <- function(x) {
+  vapply(strsplit(gsub("[^[:alpha:] -]", "", x), "[ -]+"), function(p) {
+    p <- p[nchar(p) > 0]
+    toupper(paste0(substr(p[1], 1, 1), if (length(p) > 1) substr(p[length(p)], 1, 1) else ""))
+  }, character(1))
+}
+
+org_css <- "
+.org { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; color: #0b0b0b;
+       background: #fcfcfb; padding: 28px 20px 36px; overflow-x: auto; }
+.org * { box-sizing: border-box; }
+.org-tree { display: inline-flex; flex-direction: column; align-items: center; min-width: 100%; }
+.org-top { background: #ffffff; border: 1px solid #c3c2b7; border-radius: 12px; padding: 16px 28px;
+           text-align: center; min-width: 340px; }
+.org-top h1 { font-size: 20px; margin: 0 0 4px; font-weight: 650; }
+.org-sub { font-size: 12px; color: #52514e; letter-spacing: .04em; text-transform: uppercase; }
+.org-stats { display: flex; gap: 22px; justify-content: center; margin-top: 12px; }
+.org-stat b { display: block; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.org-stat span { font-size: 11px; color: #52514e; }
+.org-score { display: inline-block; border-radius: 999px; padding: 2px 10px; }
+.org-stem { width: 2px; height: 22px; background: #c3c2b7; }
+.org-row { display: flex; align-items: flex-start; }
+.org-grp { position: relative; padding: 22px 10px 0; display: flex; flex-direction: column; align-items: center; }
+.org-grp::before { content: ''; position: absolute; top: 0; left: 50%; width: 2px; height: 22px;
+                   margin-left: -1px; background: #c3c2b7; }
+.org-grp::after  { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: #c3c2b7; }
+.org-grp:first-child::after { left: 50%; }
+.org-grp:last-child::after  { right: 50%; }
+.org-grp:only-child::after  { display: none; }
+.org-head { color: #ffffff; border-radius: 8px; padding: 7px 16px; font-size: 13px; font-weight: 600;
+            text-align: center; white-space: nowrap; }
+.org-head span { font-weight: 400; opacity: .9; margin-left: 6px; }
+.org-cards { display: grid; gap: 10px; margin-top: 10px; padding: 10px; border-radius: 12px; background: #f0efec; }
+.org-card { width: 232px; background: #ffffff; border: 1px solid #e1e0d9; border-left: 4px solid; border-radius: 8px;
+            padding: 10px 12px; display: flex; gap: 10px; }
+.org-av { flex: 0 0 34px; height: 34px; border-radius: 50%; color: #ffffff; font-size: 12px; font-weight: 600;
+          display: flex; align-items: center; justify-content: center; }
+.org-name { font-size: 13.5px; font-weight: 650; line-height: 1.25; }
+.org-role { font-size: 12px; color: #0b0b0b; margin-top: 2px; line-height: 1.3; }
+.org-meta { font-size: 11.5px; color: #52514e; margin-top: 4px; }
+.org-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.org-tag { font-size: 10.5px; background: #f0efec; color: #52514e; border-radius: 4px; padding: 1px 6px; }
+"
+
+# ---- PLOT --------------------------------------------------------------------------
+# company  = issuername
+# max_rows = cards below each other before a group starts a second column
+plot_board_organigram <- function(company, max_rows = 4) {
+
+  d <- Iss_Gov_Dir_Gen %>% filter(issuername == company)
+  d <- d %>% filter(isin == d$isin[1])
+
+  col <- function(key) {                       # column as vector, NA if the column does not exist
+    v <- org_cols[[key]]
+    if (is.null(v) || is.na(v) || !v %in% names(d)) rep(NA, nrow(d)) else d[[v]]
+  }
+
+  nm <- as.character(col("name"))
+  if (all(is.na(nm))) nm <- trimws(paste(coalesce(as.character(col("first")), ""),
+                                         coalesce(as.character(col("last")), "")))
+  nm[is.na(nm) | nm == ""] <- paste("Director", seq_len(nrow(d)))[is.na(nm) | nm == ""]
+
+  dir <- tibble(
+    name   = nm,
+    role   = as.character(col("role")),
+    group  = coalesce(as.character(col("group")), "Board of Directors"),
+    age    = suppressWarnings(as.numeric(col("age"))),
+    gender = org_gender(col("gender")),
+    tenure = suppressWarnings(as.numeric(col("tenure")))
+  )
+  dir$tags <- lapply(seq_len(nrow(d)), function(i) {
+    f <- intersect(names(org_flags), names(d))
+    unname(org_flags[f][vapply(f, function(v) org_yes(d[[v]][i]), logical(1))])
+  })
+
+  dir <- dir %>%
+    distinct(name, .keep_all = TRUE) %>%
+    mutate(lead = case_when(grepl("chair", role, ignore.case = TRUE) & !grepl("vice|deputy", role, ignore.case = TRUE) ~ 1,
+                            grepl("ceo|chief executive", role, ignore.case = TRUE) ~ 2,
+                            TRUE ~ 3)) %>%
+    arrange(org_group_rank(group), group, lead, name)
+
+  # colour follows the type of group: executives blue, non-independent orange, independent green
+  groups <- unique(dir$group)
+  pool   <- c("#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#e87ba4", "#eda100")
+  accent <- character(0)
+  for (g in groups) {
+    want <- pool[org_group_rank(g)]
+    accent[g] <- if (!want %in% accent) want else c(setdiff(pool, accent), want)[1]
+  }
+
+  # company box
+  stat <- function(value, label) div(class = "org-stat", tags$b(value), span(label))
+  fmt  <- function(x, digits = 0) if (is.na(x) || is.nan(x)) "n/a" else format(round(x, digits), nsmall = digits)
+  score <- if (exists("Gov_Total")) Gov_Total$score_total[Gov_Total$isin == d$isin[1]][1] else NA
+  stats <- list(
+    stat(nrow(dir), "directors"),
+    stat(if (all(is.na(dir$gender))) "n/a" else paste0(fmt(100 * mean(dir$gender == "Female", na.rm = TRUE)), "%"), "women"),
+    stat(fmt(mean(dir$age, na.rm = TRUE)), "average age"),
+    stat(fmt(mean(dir$tenure, na.rm = TRUE), 1), "average tenure (years)")
+  )
+  if (!is.na(score)) stats <- c(stats, list(
+    stat(span(class = "org-score",
+              style = paste0("background:", sev_fill(score), ";color:", sev_ink(score)), fmt(score, 1)),
+         "governance score")))
+
+  top <- div(class = "org-top", div(class = "org-sub", "Board of Directors"), tags$h1(company),
+             div(class = "org-stats", stats))
+
+  # one director card
+  card <- function(i, colr) {
+    r <- dir[i, ]
+    meta <- c(if (!is.na(r$age)) paste(fmt(r$age), "years"),
+              if (!is.na(r$gender)) r$gender)
+    tenure <- if (!is.na(r$tenure)) paste(fmt(r$tenure, if (r$tenure %% 1 == 0) 0 else 1), "years on board")
+    div(class = "org-card", style = paste0("border-left-color:", colr),
+        div(class = "org-av", style = paste0("background:", colr), org_initials(r$name)),
+        div(div(class = "org-name", r$name),
+            if (!is.na(r$role) && r$role != "") div(class = "org-role", r$role),
+            if (length(meta)) div(class = "org-meta", paste(meta, collapse = ", ")),
+            if (length(tenure)) div(class = "org-meta", style = "margin-top:1px", tenure),
+            if (length(r$tags[[1]])) div(class = "org-tags", lapply(r$tags[[1]], function(t) span(class = "org-tag", t)))))
+  }
+
+  # one column per group
+  grp <- lapply(groups, function(g) {
+    idx <- which(dir$group == g)
+    div(class = "org-grp",
+        div(class = "org-head", style = paste0("background:", accent[[g]]), g, span(length(idx))),
+        div(class = "org-cards",
+            style = paste0("grid-template-columns: repeat(", ceiling(length(idx) / max_rows), ", auto)"),
+            lapply(idx, card, colr = accent[[g]])))
+  })
+
+  browsable(tagList(
+    tags$style(HTML(org_css)),
+    div(class = "org", div(class = "org-tree", top, div(class = "org-stem"), div(class = "org-row", grp)))
+  ))
+}
+
+plot_board_organigram("Microsoft Corporation")
+
+# save it as a file that opens in any browser:
+# save_html(plot_board_organigram("Microsoft Corporation"), "Organigram_Microsoft.html")
