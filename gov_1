@@ -1,0 +1,133 @@
+# Provisional governance score per category (0-100, 100 = best), per company
+# Needs: Iss_Gov_Dir_Gen (one row per director) and Governance_Categ_adap (variable, category, weight)
+
+id_cols      <- c("companyid")   # <-- company key (add "year" if panel)
+women_cutoff <- 0.40
+
+# variable, treatment, direction (+1 higher is better / -1 higher is worse), aggregation to company
+# treat: binary | has_any | pct100 | calc_pct (count / board size) | cutoff | decile | ordinal
+spec <- data.frame(
+  variable = c(
+    "ratioexecutivesonboardco","boardindependenceratioco","boardindependenceratiopas",
+    "ratioindepnonexeconboardco","ratioindepnonexeconboardpas","ratioindepoutsidersonboardco",
+    "ratioindepoutsidersonboardpas","ratioinsidersonboardco","ratioinsidersonboardpas",
+    "noofaffiliateddirectorspas","pctinddirectorsinhumancapmgmt","relativeempdirectorsratio",
+    "boardindependenceratiopasworldqs",
+    "compensationqualityscoredec","overallqualityscoredec","shareholderrightsqualityscoredec",
+    "ltiperfmeasuredisclosurees","pctinddirectorsinsuccession","audcommindependenceratio",
+    "chairexcessiveboards","pctrelativedirectors","ceosigboardsorceonumberboards",
+    "isdisclosedasfinancialexpert","nooffinancialexperts","hastenurepolicy",
+    "ratioinddirectorsinauditcomm","ratioinddirectorsincompcomm","ratioinddirectorsinnomcommittee",
+    "hasrelativeincompservingasexec","providesprofservice","hasboardinterlockrelwithcompexec",
+    "noofrelativeempdirectors","noofinterlockdirectors",
+    "companyenforcementaction","companyinternalcontrolweakness",
+    "ratioofwomenonboarddqs","deidirectorskill",
+    "climatedirectorskill","pctinddirectorsininfoseccomm","infosecexpertdirector",
+    "pctinddirectorsinhealthsafety","pctinddirectorsinrisk",
+    "neomultiyearguaranteedbonus","sayonpayvoluntaryvoteadoption","ceopayptaconcernlevel",
+    "noofwomenonboard","ratioofwomenonboard",
+    "contestelectplurcarveout","capstructurematerialmodify","uncontestelectmajorityvote",
+    "supermajorityvotemerger","pctcapitalconvenespecialmtg","writtenconsent",
+    "comppolghgreduce","stilticlimateperfmeasuredisclosure","stiperfmeasuredisclosurees"),
+  treat = c(
+    "pct100","pct100","pct100","pct100","pct100","pct100","pct100","pct100","pct100",
+    "calc_pct","pct100","pct100","pct100",
+    "decile","decile","decile","pct100","pct100","pct100",
+    "binary","pct100","binary",
+    "binary","calc_pct","binary",
+    "pct100","pct100","pct100",
+    "binary","binary","binary","calc_pct","calc_pct",
+    "binary","binary",
+    "cutoff","has_any",
+    "calc_pct","pct100","calc_pct","pct100","pct100",
+    "binary","binary","ordinal",
+    "calc_pct","pct100",
+    "binary","binary","binary","binary","pct100","binary",
+    "binary","ordinal","ordinal"),
+  dir = c(
+    -1,1,1,1,1,1,1,-1,-1,
+    -1,1,-1,1,
+    -1,-1,-1,1,1,1,
+    -1,-1,-1,
+    1,1,1,
+    1,1,1,
+    -1,-1,-1,-1,-1,
+    -1,-1,
+    1,1,
+    1,1,1,1,1,
+    -1,1,-1,
+    1,1,
+    1,-1,1,-1,-1,1,
+    1,1,1),
+  stringsAsFactors = FALSE
+)
+# director-level Yes/No flags: company = 1 if ANY director is flagged (others: mean)
+spec$agg <- ifelse(spec$variable %in% c("isdisclosedasfinancialexpert",
+  "hasrelativeincompservingasexec","providesprofservice",
+  "hasboardinterlockrelwithcompexec"), "max", "mean")
+spec <- spec[spec$variable %in% names(Iss_Gov_Dir_Gen), ]
+
+to_num <- function(x) {
+  if (is.numeric(x) || is.logical(x)) return(as.numeric(x))
+  y <- tolower(trimws(as.character(x)))
+  out <- suppressWarnings(as.numeric(y))
+  out[y %in% c("yes", "y", "true")] <- 1
+  out[y %in% c("no", "n", "false")] <- 0
+  out[y == "low"] <- 1
+  out[y %in% c("medium", "moderate")] <- 2
+  out[y == "high"] <- 3
+  out[y %in% c("very high", "severe")] <- 4
+  out
+}
+agg_fun <- function(v, how) {
+  v <- v[!is.na(v)]
+  if (length(v) == 0) return(NA_real_)
+  if (how == "max") max(v) else mean(v)
+}
+
+# 1) directors -> one row per company
+dat <- as.data.frame(Iss_Gov_Dir_Gen)
+key <- do.call(paste, c(dat[id_cols], sep = "\r"))
+firm <- dat[!duplicated(key), id_cols, drop = FALSE]
+fkey <- do.call(paste, c(firm[id_cols], sep = "\r"))
+firm$board_size <- as.numeric(table(key)[fkey])
+for (i in seq_len(nrow(spec))) {
+  v <- spec$variable[i]
+  firm[[v]] <- as.numeric(tapply(to_num(dat[[v]]), factor(key, levels = fkey),
+                                 agg_fun, how = spec$agg[i]))
+}
+
+# 2) score every variable 0-1 (1 = best)
+score_var <- function(i) {
+  v <- spec$variable[i]; raw <- firm[[v]]; tr <- spec$treat[i]
+  p <- if (all(is.na(raw)) || max(raw, na.rm = TRUE) <= 1) 1 else 100
+  s <- switch(tr,
+    binary   = raw,
+    has_any  = as.numeric(raw > 0),
+    pct100   = raw / p,
+    calc_pct = raw / firm$board_size,
+    cutoff   = pmin((raw / p) / women_cutoff, 1),
+    decile   = (raw - 1) / 9,
+    ordinal  = (raw - min(raw, na.rm = TRUE)) / (max(raw, na.rm = TRUE) - min(raw, na.rm = TRUE)))
+  s <- pmin(pmax(s, 0), 1)
+  if (spec$dir[i] == -1) 1 - s else s
+}
+scores <- sapply(seq_len(nrow(spec)), score_var)
+colnames(scores) <- spec$variable
+
+# 3) weighted mean per category (weights from Governance_Categ_adap), x100
+cat_map <- unique(as.data.frame(Governance_Categ_adap)[, c("variable", "category", "weight")])
+cat_map <- cat_map[match(spec$variable, cat_map$variable), ]
+Gov_Cat_Scores <- firm[id_cols]
+for (cat in unique(cat_map$category)) {
+  idx <- which(cat_map$category == cat)
+  w   <- cat_map$weight[idx]
+  w[is.na(w)] <- mean(w, na.rm = TRUE)
+  if (all(is.na(w))) w <- rep(1, length(idx))
+  s   <- scores[, idx, drop = FALSE]
+  W   <- matrix(w, nrow(s), length(w), byrow = TRUE)
+  W[is.na(s)] <- 0
+  s[is.na(s)] <- 0
+  Gov_Cat_Scores[[paste0("score_", gsub("[^a-z]+", "_", tolower(cat)))]] <-
+    ifelse(rowSums(W) == 0, NA, 100 * rowSums(W * s) / rowSums(W))
+}
