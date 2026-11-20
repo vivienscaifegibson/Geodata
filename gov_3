@@ -1,0 +1,300 @@
+##### 3.4) Create Gov Score #####
+
+library(dplyr)
+library(tidyr)
+library(plotly)
+
+# - Join Director / Quali data
+
+Iss_Gov_Dir_Gen <- ISS_PORT_GOV_DIR_adap %>%
+  left_join(ISS_PORT_GOV_QUAL_adap %>%
+              select(-c(gicssubindustry, gicssector, gicsindustrygroup, gicsindustry,
+                        issuername, countryofincorporation)),
+            by = "isin")
+
+women_cutoff <- 0.40
+
+# ---- SPEC: one row per variable -------------------------------------------------
+# treat: pct100   = SCALE 1:100
+#        calc_pct = CALC PERCENTAGE (count / board size)
+#        binary   = YES / NO
+#        has_any  = YES / NO (count > 0)
+#        cutoff   = SCALE 1:100, full score from women_cutoff upwards
+#        decile   = ISS decile 1-10 (1 = lowest risk)
+#        ordinal  = level, min-max scaled over all companies
+# dir  :  1 = higher is better, -1 = higher is worse
+spec <- tribble(
+  ~variable,                            ~treat,     ~dir,
+  # Board Independence
+  "ratioexecutivesonboardco",           "pct100",    -1,
+  "boardindependenceratioco",           "pct100",     1,
+  "boardindependenceratiopas",          "pct100",     1,
+  "ratioindepnonexeconboardco",         "pct100",     1,
+  "ratioindepnonexeconboardpas",        "pct100",     1,
+  "ratioindepoutsidersonboardco",       "pct100",     1,
+  "ratioindepoutsidersonboardpas",      "pct100",     1,
+  "ratioinsidersonboardco",             "pct100",    -1,
+  "ratioinsidersonboardpas",            "pct100",    -1,
+  "noofaffiliateddirectorspas",         "calc_pct",  -1,
+  "pctinddirectorsinhumancapmgmt",      "pct100",     1,
+  "relativeempdirectorsratio",          "pct100",    -1,
+  "boardindependenceratiopasworldqs",   "pct100",     1,
+  # Audit & Controls
+  "compensationqualityscoredec",        "decile",    -1,
+  "overallqualityscoredec",             "decile",    -1,
+  "shareholderrightsqualityscoredec",   "decile",    -1,
+  "ltiperfmeasuredisclosurees",         "pct100",     1,
+  "pctinddirectorsinsuccession",        "pct100",     1,
+  "audcommindependenceratio",           "pct100",     1,
+  # Board Effectiveness
+  "chairexcessiveboards",               "binary",    -1,
+  "pctrelativedirectors",               "pct100",    -1,
+  "ceosigboardsorceonumberboards",      "binary",    -1,
+  # Board Expertise
+  "isdisclosedasfinancialexpert",       "binary",     1,
+  "nooffinancialexperts",               "calc_pct",   1,
+  # Board Refreshment
+  "hastenurepolicy",                    "binary",     1,
+  # Committee Independence
+  "ratioinddirectorsinauditcomm",       "pct100",     1,
+  "ratioinddirectorsincompcomm",        "pct100",     1,
+  "ratioinddirectorsinnomcommittee",    "pct100",     1,
+  # Conflict of Interest
+  "hasrelativeincompservingasexec",     "binary",    -1,
+  "providesprofservice",                "binary",    -1,
+  "hasboardinterlockrelwithcompexec",   "binary",    -1,
+  "noofrelativeempdirectors",           "calc_pct",  -1,
+  "noofinterlockdirectors",             "calc_pct",  -1,
+  # Controversy
+  "companyenforcementaction",           "binary",    -1,
+  "companyinternalcontrolweakness",     "binary",    -1,
+  # Diversity & Human Capital
+  "ratioofwomenonboardqs",              "cutoff",     1,
+  "deidirectorskill",                   "has_any",    1,
+  # Emerging Risks Oversight
+  "climatedirectorskill",               "calc_pct",   1,
+  "pctinddirectorsininfoseccomm",       "pct100",     1,
+  "infosecexpertdirector",              "calc_pct",   1,
+  "pctinddirectorsinhealthsafety",      "pct100",     1,
+  "pctinddirectorsinrisk",              "pct100",     1,
+  # Executive Compensation
+  "neomultiyearguaranteedbonus",        "binary",    -1,
+  "sayonpayvoluntaryvoteadoption",      "binary",     1,
+  "ceopayptaconcernlevel",              "ordinal",   -1,
+  # Gender Equality
+  "noofwomenonboard",                   "calc_pct",   1,
+  "ratioofwomenonboard",                "pct100",     1,
+  # Shareholder Rights
+  "contestelectplurcarveout",           "binary",     1,
+  "capstructurematerialmodify",         "binary",    -1,
+  "uncontestelectmajorityvote",         "binary",     1,
+  "supermajorityvotemerger",            "binary",    -1,
+  "pctcapitalconvenespecialmtg",        "pct100",    -1,
+  "writtenconsent",                     "binary",     1,
+  # Sustainability Oversight (add on)
+  "comppolghgreduce",                   "binary",     1,
+  "stilticlimateperfmeasuredisclosure", "ordinal",    1,
+  "stiperfmeasuredisclosurees",         "ordinal",    1
+)
+
+# YES / NO flags that sit on director level: company = 1 if ANY director is flagged
+spec$agg <- ifelse(spec$variable %in% c("isdisclosedasfinancialexpert",
+                                        "hasrelativeincompservingasexec",
+                                        "providesprofservice",
+                                        "hasboardinterlockrelwithcompexec"),
+                   "max", "mean")
+
+# ---- WEIGHTS: equal weight per category, equal weight per variable in a category --
+# only variables that are actually scored count, so all weights sum to 1
+Gov_Weights <- Governance_Categ_adap %>%
+  filter(variable %in% spec$variable) %>%
+  distinct(variable, category) %>%
+  mutate(weight_cat = 1 / n_distinct(category)) %>%
+  group_by(category) %>%
+  mutate(weight = weight_cat / n()) %>%
+  ungroup()
+
+# ---- HELPERS ---------------------------------------------------------------------
+to_num <- function(x) {
+  if (is.numeric(x) || is.logical(x)) return(as.numeric(x))
+  y <- tolower(trimws(as.character(x)))
+  out <- suppressWarnings(as.numeric(y))
+  out[y %in% c("yes", "y", "true")] <- 1
+  out[y %in% c("no", "n", "false")] <- 0
+  out[y == "low"] <- 1
+  out[y %in% c("medium", "moderate")] <- 2
+  out[y == "high"] <- 3
+  out[y %in% c("very high", "severe")] <- 4
+  out
+}
+
+agg_fun <- function(v, how) {
+  v <- v[!is.na(v)]
+  if (length(v) == 0) return(NA_real_)
+  if (how == "max") max(v) else mean(v)
+}
+
+# is a percentage stored as 0-1 or as 0-100?
+pct_base <- function(x) if (all(is.na(x)) || max(x, na.rm = TRUE) <= 1) 1 else 100
+
+minmax <- function(x) {
+  if (all(is.na(x))) return(x)
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+# ---- 1) DIRECTORS -> ONE ROW PER COMPANY -----------------------------------------
+Gov_Firm <- Iss_Gov_Dir_Gen %>%
+  group_by(isin) %>%
+  summarise(
+    issuername = first(issuername),
+    board_size = n(),
+    across(all_of(spec$variable[spec$agg == "mean"]), ~ agg_fun(to_num(.x), "mean")),
+    across(all_of(spec$variable[spec$agg == "max"]),  ~ agg_fun(to_num(.x), "max")),
+    .groups = "drop"
+  )
+
+# ---- 2) SCORE EVERY VARIABLE 0-100 (100 = best) ----------------------------------
+Gov_Var_Scores <- Gov_Firm %>%
+  pivot_longer(all_of(spec$variable), names_to = "variable", values_to = "value") %>%
+  left_join(spec, by = "variable") %>%
+  inner_join(Gov_Weights, by = "variable") %>%     # variables without a category drop out
+  group_by(variable) %>%
+  mutate(
+    p = pct_base(value),
+    s = case_when(
+      treat == "binary"   ~ value,
+      treat == "has_any"  ~ as.numeric(value > 0),
+      treat == "pct100"   ~ value / p,
+      treat == "calc_pct" ~ value / board_size,
+      treat == "cutoff"   ~ (value / p) / women_cutoff,
+      treat == "decile"   ~ (value - 1) / 9,
+      treat == "ordinal"  ~ minmax(value)
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    s     = pmin(pmax(s, 0), 1),
+    score = 100 * if_else(dir == -1, 1 - s, s)
+  ) %>%
+  select(isin, issuername, category, variable, treat, dir, agg, value, score, weight, weight_cat)
+
+# ---- 3) CATEGORY SCORE + TOTAL SCORE ---------------------------------------------
+# missing variables are skipped and the remaining weights re-normalised
+Gov_Cat_Long <- Gov_Var_Scores %>%
+  filter(!is.na(score)) %>%
+  group_by(isin, issuername, category, weight_cat) %>%
+  summarise(score = weighted.mean(score, weight), .groups = "drop")
+
+Gov_Total <- Gov_Cat_Long %>%
+  group_by(isin, issuername) %>%
+  summarise(score_total = weighted.mean(score, weight_cat), .groups = "drop")
+
+Gov_Cat_Scores <- Gov_Cat_Long %>%
+  mutate(name = paste0("score_", gsub("[^a-z]+", "_", tolower(category)))) %>%
+  select(isin, name, score) %>%
+  pivot_wider(names_from = name, values_from = score) %>%
+  left_join(Gov_Total %>% select(isin, score_total), by = "isin")
+
+Gov_JOIN <- Iss_Gov_Dir_Gen %>% left_join(Gov_Cat_Scores, by = "isin")
+
+# !!!!!!!!!!!!!! ANHAND DIESER BEISPIELE NACHSEHEN: Volksbank schlechte Governance / Microsoft gute Governance
+
+
+##### 3.5) Sunburst plot #####
+
+# severity bands for a 0-100 score
+sev_fill <- function(score) {
+  case_when(is.na(score) ~ "#d9d8d2",   # no data
+            score >= 75  ~ "#0ca30c",   # good
+            score >= 50  ~ "#fab219",   # warning
+            score >= 25  ~ "#ec835a",   # serious
+            TRUE         ~ "#d03b3b")   # critical
+}
+sev_ink <- function(score) if_else(is.na(score) | (score >= 25 & score < 75), "#0b0b0b", "#ffffff")
+
+criterion_lab <- c(pct100   = "SCALE 1:100",
+                   calc_pct = "CALC PERCENTAGE",
+                   binary   = "YES / NO",
+                   has_any  = "YES / NO (count > 0)",
+                   cutoff   = paste0("SCALE 1:100, cutoff ", 100 * women_cutoff, "%"),
+                   decile   = "DECILE 1-10",
+                   ordinal  = "LEVEL (min-max)")
+
+pct_lab <- function(w) paste0(format(round(100 * w, 1), nsmall = 1, trim = TRUE), "%")
+num_lab <- function(x) if_else(is.na(x), "no data", format(round(x, 1), nsmall = 1, trim = TRUE))
+
+# company  = issuername shown in the middle
+# category = optional, opens the plot zoomed into one category (same as clicking on it)
+plot_gov_sunburst <- function(company, category = NULL) {
+
+  zoom <- category
+  id   <- Gov_Firm$isin[Gov_Firm$issuername == company][1]
+  tot  <- Gov_Total       %>% filter(isin == id)
+  vars <- Gov_Var_Scores  %>% filter(isin == id)
+  rows <- Iss_Gov_Dir_Gen %>% filter(isin == id)
+  # every category of the company gets a node, also one without any usable data (grey)
+  cats <- vars %>%
+    distinct(category, weight_cat) %>%
+    left_join(Gov_Cat_Long %>% filter(isin == id) %>% select(category, score), by = "category")
+
+  # realisation = value as it stands in the data (first non-missing row of the company)
+  realisation <- function(v) {
+    x <- rows[[v]]
+    x <- x[!is.na(x)][1]
+    if (is.numeric(x)) as.character(round(x, 2)) else as.character(x)
+  }
+  vars$realisation <- vapply(vars$variable, realisation, character(1))
+
+  # centre: company + total score
+  root <- tibble(
+    id = "root", parent = "", size = 0, score = c(tot$score_total, NA)[1],
+    text = paste0("<b>", company, "</b><br>Governance Score<br><b>", num_lab(score), "</b>")
+  )
+
+  # inner ring: categories with weight + score
+  cat_nodes <- cats %>%
+    transmute(
+      id = category, parent = "root", size = 0, score,
+      text = paste0("<b>", category, "</b>",
+                    "<br>Weight: ", pct_lab(weight_cat),
+                    "<br>Score: ", num_lab(score))
+    )
+
+  # outer ring: variables with weight, score, criterion and realisation
+  var_nodes <- vars %>%
+    transmute(
+      id = paste(category, variable, sep = " / "), parent = category, size = weight, score,
+      text = paste0("<b>", variable, "</b>",
+                    "<br>Weight: ", pct_lab(weight), " | Score: ", num_lab(score),
+                    "<br>", criterion_lab[treat],
+                    if_else(dir == 1, " (high = good)", " (high = bad)"),
+                    if_else(category == "Sustainability Oversight", " | ADD ON", ""),
+                    "<br>Value: ",
+                    case_when(is.na(value) ~ "no data",
+                              agg == "max" ~ if_else(value == 1, "Yes (any director)", "No (no director)"),
+                              TRUE ~ realisation))
+    )
+
+  nodes <- bind_rows(root, cat_nodes, var_nodes)
+
+  plot_ly(
+    type    = "sunburst",
+    ids     = nodes$id,
+    labels  = nodes$id,
+    parents = nodes$parent,
+    values  = nodes$size,             # only the variables carry a size -> full circle
+    level   = if (is.null(zoom)) "root" else zoom,
+    text    = nodes$text,
+    textinfo  = "text",               # no label + text -> nothing is doubled
+    hoverinfo = "none",               # no hover
+    sort = FALSE,
+    insidetextorientation = "radial",
+    marker   = list(colors = sev_fill(nodes$score), line = list(color = "#ffffff", width = 2)),
+    leaf     = list(opacity = 1),
+    textfont = list(color = sev_ink(nodes$score))
+  ) %>%
+    layout(margin = list(t = 10, l = 10, r = 10, b = 10))
+}
+
+plot_gov_sunburst("Microsoft Corporation")
+# plot_gov_sunburst("Microsoft Corporation", category = "Board Independence")
