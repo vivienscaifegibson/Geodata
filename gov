@@ -1,0 +1,219 @@
+# =============================================================================
+# PROVISIONAL GOVERNANCE SCORE PER CATEGORY (per company)
+# Input : Iss_Gov_Dir_Gen          (n rows per company = one row per director)
+#         Governance_Categ_adap    (source, category, variable, description, weight)
+# Output: Gov_Cat_Scores_wide      one row per company, one column per category (0-100)
+#         Gov_Cat_Scores_long      company x category, with n variables used / coverage
+#         Gov_Var_Scores_long      company x variable, scored 0-1 (for auditing)
+# Convention: every variable is turned into a 0-1 score where 1 = best governance,
+#             then category score = weighted mean (weights from Governance_Categ_adap)
+#             x 100. Missing variables are skipped and weights re-normalised.
+# =============================================================================
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+
+# ---- 0. SETTINGS -------------------------------------------------------------
+id_cols      <- c("companyid")  # <-- CHANGE: company key (add "year" if it is a panel)
+women_cutoff <- 0.40            # share of women at/above which ratioofwomenonboarddqs = full score
+data_in      <- Iss_Gov_Dir_Gen
+categ_in     <- Governance_Categ_adap
+
+if (!all(id_cols %in% names(data_in))) {
+  stop("id_cols not found in Iss_Gov_Dir_Gen. Candidates: ",
+       paste(grep("id|isin|ticker|company|year", names(data_in), value = TRUE,
+                  ignore.case = TRUE), collapse = ", "))
+}
+
+# ---- 1. SPEC: what to do with each variable (from your RStudio comments) ------
+# treat: binary    = Yes/No (1/0)
+#        has_any   = count > 0 -> 1, else 0
+#        pct100    = already a 1:100 percentage -> /100
+#        calc_pct  = count / board size (= number of director rows of the company)
+#        cutoff    = share of women, capped at women_cutoff
+#        decile    = ISS QualityScore decile 1-10 (1 = lowest risk) -> (x-1)/9
+#        ordinal   = ordered level, min-max scaled over the sample
+# dir  : +1 = higher is better, -1 = higher is worse (score is flipped)
+# agg  : how director rows collapse to the company: "mean" (default) or "max" (= any)
+spec <- tribble(
+  ~variable,                          ~treat,     ~dir, ~agg,
+  # Board Independence
+  "ratioexecutivesonboardco",         "pct100",    -1,  "mean",
+  "boardindependenceratioco",         "pct100",     1,  "mean",
+  "boardindependenceratiopas",        "pct100",     1,  "mean",
+  "ratioindepnonexeconboardco",       "pct100",     1,  "mean",
+  "ratioindepnonexeconboardpas",      "pct100",     1,  "mean",
+  "ratioindepoutsidersonboardco",     "pct100",     1,  "mean",
+  "ratioindepoutsidersonboardpas",    "pct100",     1,  "mean",
+  "ratioinsidersonboardco",           "pct100",    -1,  "mean",
+  "ratioinsidersonboardpas",          "pct100",    -1,  "mean",
+  "noofaffiliateddirectorspas",       "calc_pct",  -1,  "mean",
+  "pctinddirectorsinhumancapmgmt",    "pct100",     1,  "mean",
+  "relativeempdirectorsratio",        "pct100",    -1,  "mean",
+  "boardindependenceratiopasworldqs", "pct100",     1,  "mean",
+  # Audit & Controls
+  "compensationqualityscoredec",      "decile",    -1,  "mean",
+  "overallqualityscoredec",           "decile",    -1,  "mean",
+  "shareholderrightsqualityscoredec", "decile",    -1,  "mean",
+  "ltiperfmeasuredisclosurees",       "pct100",     1,  "mean",
+  "pctinddirectorsinsuccession",      "pct100",     1,  "mean",
+  "audcommindependenceratio",         "pct100",     1,  "mean",
+  # Board Effectiveness
+  "chairexcessiveboards",             "binary",    -1,  "mean",
+  "pctrelativedirectors",             "pct100",    -1,  "mean",
+  "ceosigboardsorceonumberboards",    "binary",    -1,  "mean",
+  # Board Expertise
+  "isdisclosedasfinancialexpert",     "binary",     1,  "max",   # >= 1 financial expert
+  "nooffinancialexperts",             "calc_pct",   1,  "mean",
+  # Board Refreshment
+  "hastenurepolicy",                  "binary",     1,  "mean",
+  # Committee Independence
+  "ratioinddirectorsinauditcomm",     "pct100",     1,  "mean",
+  "ratioinddirectorsincompcomm",      "pct100",     1,  "mean",
+  "ratioinddirectorsinnomcommittee",  "pct100",     1,  "mean",
+  # Conflict of Interest
+  "hasrelativeincompservingasexec",   "binary",    -1,  "max",   # any director flagged
+  "providesprofservice",              "binary",    -1,  "max",
+  "hasboardinterlockrelwithcompexec", "binary",    -1,  "max",
+  "noofrelativeempdirectors",         "calc_pct",  -1,  "mean",
+  "noofinterlockdirectors",           "calc_pct",  -1,  "mean",
+  # Controversy
+  "companyenforcementaction",         "binary",    -1,  "mean",
+  "companyinternalcontrolweakness",   "binary",    -1,  "mean",
+  # Diversity & Human Capital
+  "ratioofwomenonboarddqs",           "cutoff",     1,  "mean",
+  "deidirectorskill",                 "has_any",    1,  "mean",
+  # Emerging Risks Oversight
+  "climatedirectorskill",             "calc_pct",   1,  "mean",
+  "pctinddirectorsininfoseccomm",     "pct100",     1,  "mean",
+  "infosecexpertdirector",            "calc_pct",   1,  "mean",
+  "pctinddirectorsinhealthsafety",    "pct100",     1,  "mean",
+  "pctinddirectorsinrisk",            "pct100",     1,  "mean",
+  # Executive Compensation
+  "neomultiyearguaranteedbonus",      "binary",    -1,  "mean",
+  "sayonpayvoluntaryvoteadoption",    "binary",     1,  "mean",
+  "ceopayptaconcernlevel",            "ordinal",   -1,  "mean",
+  # Gender Equality
+  "noofwomenonboard",                 "calc_pct",   1,  "mean",
+  "ratioofwomenonboard",              "pct100",     1,  "mean",
+  # Shareholder Rights
+  "contestelectplurcarveout",         "binary",     1,  "mean",  # CHECK direction
+  "capstructurematerialmodify",       "binary",    -1,  "mean",
+  "uncontestelectmajorityvote",       "binary",     1,  "mean",
+  "supermajorityvotemerger",          "binary",    -1,  "mean",
+  "pctcapitalconvenespecialmtg",      "pct100",    -1,  "mean",  # lower threshold = better
+  "writtenconsent",                   "binary",     1,  "mean",
+  # Sustainability Oversight (all "YES AS ADD ON")
+  "comppolghgreduce",                 "binary",     1,  "mean",
+  "stilticlimateperfmeasuredisclosure", "ordinal",  1,  "mean",
+  "stiperfmeasuredisclosurees",       "ordinal",    1,  "mean"
+)
+
+# ---- 2. CHECKS ---------------------------------------------------------------
+miss_data  <- setdiff(spec$variable, names(data_in))
+miss_categ <- setdiff(spec$variable, categ_in$variable)
+if (length(miss_data))  warning("In spec but NOT a column of Iss_Gov_Dir_Gen: ",
+                                paste(miss_data, collapse = ", "))
+if (length(miss_categ)) warning("In spec but NOT in Governance_Categ_adap: ",
+                                paste(miss_categ, collapse = ", "))
+spec <- filter(spec, variable %in% names(data_in), variable %in% categ_in$variable)
+
+# ---- 3. CLEAN VALUES -> NUMERIC ----------------------------------------------
+to_num <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  if (is.logical(x)) return(as.numeric(x))
+  y <- str_to_lower(str_trim(as.character(x)))
+  out <- suppressWarnings(as.numeric(y))
+  out[y %in% c("yes", "y", "true")]       <- 1
+  out[y %in% c("no", "n", "false")]       <- 0
+  out[y %in% c("low")]                    <- 1   # ordinal levels (ceopayptaconcernlevel)
+  out[y %in% c("medium", "moderate")]     <- 2
+  out[y %in% c("high")]                   <- 3
+  out[y %in% c("very high", "severe")]    <- 4
+  out
+}
+agg_fun <- function(v, how) {
+  if (all(is.na(v))) return(NA_real_)
+  if (how == "max") max(v, na.rm = TRUE) else mean(v, na.rm = TRUE)
+}
+
+# ---- 4. DIRECTOR ROWS -> ONE ROW PER COMPANY ---------------------------------
+vars_mean <- spec$variable[spec$agg == "mean"]
+vars_max  <- spec$variable[spec$agg == "max"]
+
+firm <- data_in %>%
+  group_by(across(all_of(id_cols))) %>%
+  summarise(
+    board_size = n(),                                   # number of director rows
+    across(all_of(vars_mean), ~ agg_fun(to_num(.x), "mean")),
+    across(all_of(vars_max),  ~ agg_fun(to_num(.x), "max")),
+    .groups = "drop"
+  )
+
+# ---- 5. SCORE EVERY VARIABLE 0-1 (1 = best) ----------------------------------
+var_scores <- firm %>%
+  pivot_longer(all_of(spec$variable), names_to = "variable", values_to = "raw") %>%
+  left_join(spec, by = "variable") %>%
+  group_by(variable) %>%
+  mutate(
+    all_na = all(is.na(raw)),
+    p_guard = if (all_na[1]) 1 else if (max(raw, na.rm = TRUE) > 1) 100 else 1,  # 0-1 or 0-100?
+    rng_min = suppressWarnings(min(raw, na.rm = TRUE)),
+    rng_max = suppressWarnings(max(raw, na.rm = TRUE))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    s = case_when(
+      treat == "binary"   ~ raw,
+      treat == "has_any"  ~ as.numeric(raw > 0),
+      treat == "pct100"   ~ raw / p_guard,
+      treat == "calc_pct" ~ raw / board_size,
+      treat == "cutoff"   ~ pmin((raw / p_guard) / women_cutoff, 1),
+      treat == "decile"   ~ (raw - 1) / 9,
+      treat == "ordinal"  ~ if_else(rng_max > rng_min, (raw - rng_min) / (rng_max - rng_min), NA_real_),
+      TRUE                ~ NA_real_
+    ),
+    s = pmin(pmax(s, 0), 1),
+    score = if_else(dir == -1, 1 - s, s)
+  ) %>%
+  select(all_of(id_cols), variable, treat, dir, raw, score)
+
+dead <- var_scores %>% group_by(variable) %>% summarise(n_ok = sum(!is.na(score))) %>%
+  filter(n_ok == 0)
+if (nrow(dead)) warning("No usable values (check coding/legend) for: ",
+                        paste(dead$variable, collapse = ", "))
+
+# ---- 6. CATEGORY SCORE = WEIGHTED MEAN, x100 ---------------------------------
+Gov_Var_Scores_long <- var_scores %>%
+  left_join(distinct(categ_in, variable, source, category, weight), by = "variable")
+
+n_possible <- Gov_Var_Scores_long %>%
+  distinct(variable, category) %>% count(category, name = "n_vars_possible")
+
+Gov_Cat_Scores_long <- Gov_Var_Scores_long %>%
+  filter(!is.na(score)) %>%
+  group_by(across(all_of(id_cols)), category) %>%
+  mutate(w = if (all(is.na(weight)) || sum(weight, na.rm = TRUE) <= 0) 1
+             else coalesce(weight, mean(weight, na.rm = TRUE))) %>%
+  summarise(
+    gov_score   = 100 * sum(w * score) / sum(w),
+    n_vars_used = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(n_possible, by = "category") %>%
+  mutate(coverage = n_vars_used / n_vars_possible)
+
+Gov_Cat_Scores_wide <- Gov_Cat_Scores_long %>%
+  mutate(cat_nm = paste0("score_", str_to_lower(str_replace_all(category, "[^A-Za-z]+", "_")))) %>%
+  select(all_of(id_cols), cat_nm, gov_score) %>%
+  pivot_wider(names_from = cat_nm, values_from = gov_score)
+
+# ---- 7. QUICK LOOK -----------------------------------------------------------
+Gov_Cat_Scores_wide %>% print(n = 10, width = Inf)
+Gov_Cat_Scores_long %>% group_by(category) %>%
+  summarise(mean = mean(gov_score), sd = sd(gov_score),
+            min = min(gov_score), max = max(gov_score),
+            coverage = mean(coverage), .groups = "drop") %>%
+  print(n = Inf)
