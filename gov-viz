@@ -47,6 +47,7 @@ org_class <- tribble(
   "ER",           "Employee Representative",                 "#6250d6",   # employee side: violet
   "ESR",          "Employee Shareholder Representative",     "#6250d6",
   "IO",           "Independent Outsider",                    "#1baf7a",   # independent: green
+  "I-NED",        "Independent Non-Executive Director",      "#1baf7a",
   "UO",           "Unclassified Outsider",                   "#7a7972",   # unclassified: grey
   "Unclassified", "Unclassified",                            "#7a7972"
 )
