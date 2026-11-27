@@ -1,0 +1,277 @@
+##### 3.7) Board organigram (leaflet) #####
+# Needs Iss_Gov_Dir_Gen (one row per director).
+# Drag to move, scroll to zoom. The cards grow and shrink with the zoom.
+
+library(dplyr)
+library(htmltools)
+library(leaflet)
+
+# ---- COLUMNS ---------------------------------------------------------------------
+# The first column name that exists is used, otherwise the column is guessed from
+# its name. If a guess is wrong, set it by hand, e.g. org_cols$name <- "fullname"
+org_pick <- function(candidates, pattern = NULL, exclude = "issuer|company|committee|avg|policy|ratio|noof",
+                     text_only = FALSE) {
+  nm  <- names(Iss_Gov_Dir_Gen)
+  hit <- candidates[candidates %in% nm]
+  if (length(hit)) return(hit[1])
+  if (is.null(pattern)) return(NA_character_)
+  nm <- nm[grepl(pattern, nm, ignore.case = TRUE) & !grepl(exclude, nm, ignore.case = TRUE)]
+  if (text_only) nm <- nm[vapply(nm, function(v) !is.numeric(Iss_Gov_Dir_Gen[[v]]), logical(1))]
+  if (length(nm) == 0) return(NA_character_)
+  nm[which.max(vapply(nm, function(v) n_distinct(Iss_Gov_Dir_Gen[[v]]), numeric(1)))]
+}
+
+org_cols <- list(
+  name   = org_pick(character(0), "name", text_only = TRUE,
+                    exclude = "issuer|company|committee|first|last|given|middle|sur|family|vor|nach"),
+  first  = org_pick(character(0), "^first|^given|vorname", text_only = TRUE),   # only used without a full name
+  last   = org_pick(character(0), "^last|^sur|^family|nachname", text_only = TRUE),
+  role   = org_pick(character(0), "role|title|position|function", text_only = TRUE),
+  # classification that forms the columns of the organigram: ISS first, then the company's own
+  group  = org_pick(c("iss_affiliation_classification", "dirclassificationpas",
+                      "company_affiliation_classification", "dirclassificationco")),
+  age    = org_pick("age", "^age$|director_?age"),
+  gender = org_pick("gender", "gender|sex"),
+  tenure = org_pick("tenure", "tenure")
+)
+
+# ---- CLASSIFICATION CODES --------------------------------------------------------
+# order = order of the columns from left to right; colour = one colour per type of director
+org_class <- tribble(
+  ~code,          ~label,                                    ~colour,
+  "Exec",         "Executive",                               "#2a78d6",   # executives: blue
+  "I",            "Insider",                                 "#2a78d6",
+  "NEI",          "Non-Executive Insider",                   "#eb6834",   # not independent: orange
+  "NI-NED",       "Non-Independent Non-Executive Director",  "#eb6834",
+  "AO",           "Affiliated Outsider",                     "#eb6834",
+  "ER",           "Employee Representative",                 "#6250d6",   # employee side: violet
+  "ESR",          "Employee Shareholder Representative",     "#6250d6",
+  "IO",           "Independent Outsider",                    "#1baf7a",   # independent: green
+  "UO",           "Unclassified Outsider",                   "#7a7972",   # unclassified: grey
+  "Unclassified", "Unclassified",                            "#7a7972"
+)
+
+# ---- FLAGS: Yes/No columns shown as tags on the director card ---------------------
+# type: "good" = green, "bad" = red, "neutral" = grey
+org_flags <- tribble(
+  ~column,                              ~label,                     ~type,
+  "isdisclosedasfinancialexpert",       "Financial expert",         "good",
+  "isformernoninterimceo",              "Former CEO",               "neutral",
+  "isformeremployee",                   "Former employee",          "neutral",
+  "providesprofservice",                "Provides prof. services",  "bad",
+  "hasrelativeincompservingasexec",     "Relative is executive",    "bad",
+  "hasboardinterlockrelwithcompexec",   "Board interlock",          "bad"
+)
+
+# ---- HELPERS ---------------------------------------------------------------------
+org_yes <- function(x) {
+  if (is.numeric(x) || is.logical(x)) return(!is.na(x) & as.numeric(x) == 1)
+  tolower(trimws(as.character(x))) %in% c("yes", "y", "true", "1")
+}
+
+org_gender <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  case_when(is.na(x) | y == ""                  ~ NA_character_,
+            substr(y, 1, 1) %in% c("f", "w")    ~ "Female",
+            substr(y, 1, 1) == "m"              ~ "Male",
+            TRUE                                ~ as.character(x))
+}
+
+org_initials <- function(x) {
+  vapply(strsplit(gsub("[^[:alpha:] -]", "", x), "[ -]+"), function(p) {
+    p <- p[nchar(p) > 0]
+    toupper(paste0(substr(p[1], 1, 1), if (length(p) > 1) substr(p[length(p)], 1, 1) else ""))
+  }, character(1))
+}
+
+org_css <- "
+.leaflet-container { background: #fcfcfb; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+.leaflet-tooltip.org-lbl { background: transparent; border: 0; box-shadow: none; padding: 0; margin: 0;
+                           white-space: normal; color: #0b0b0b; opacity: 1 !important; }
+.leaflet-tooltip.org-lbl::before { display: none; }
+.org-node { box-sizing: border-box; overflow: hidden; transform: scale(var(--org-s, 1)); transform-origin: center center; }
+.org-node * { box-sizing: border-box; }
+.org-top { background: #ffffff; border: 1px solid #c3c2b7; border-radius: 12px; padding: 14px 20px; text-align: center; }
+.org-top h1 { font-size: 20px; margin: 2px 0 0; font-weight: 650; line-height: 1.2; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; }
+.org-sub { font-size: 11px; color: #52514e; letter-spacing: .04em; text-transform: uppercase; }
+.org-stats { display: flex; gap: 22px; justify-content: center; margin-top: 10px; }
+.org-stat b { display: block; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.org-stat span { font-size: 11px; color: #52514e; }
+.org-head { color: #ffffff; border-radius: 8px; padding: 0 12px; font-size: 12.5px; font-weight: 600; line-height: 1.2;
+            text-align: center; display: flex; align-items: center; justify-content: center; }
+.org-card { background: #ffffff; border: 1px solid #e1e0d9; border-left: 4px solid; border-radius: 8px;
+            padding: 10px 12px; display: flex; gap: 10px; }
+.org-av { flex: 0 0 34px; height: 34px; border-radius: 50%; color: #ffffff; font-size: 12px; font-weight: 600;
+          display: flex; align-items: center; justify-content: center; }
+.org-txt { min-width: 0; }
+.org-name { font-size: 13.5px; font-weight: 650; line-height: 17px; }
+.org-role { font-size: 12px; line-height: 16px; margin-top: 2px; }
+.org-name, .org-role { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.org-meta { font-size: 11.5px; line-height: 15px; color: #52514e; }
+.org-tag { display: table; font-size: 10.5px; line-height: 14px; border-radius: 4px; padding: 2px 7px; margin-top: 2px;
+           white-space: nowrap; font-weight: 600; }
+.org-tag.good    { background: #dff3df; color: #006300; }
+.org-tag.bad     { background: #fbe1e1; color: #a61b1b; }
+.org-tag.neutral { background: #f0efec; color: #52514e; font-weight: 400; }
+"
+
+# ---- LAYOUT: positions of all boxes in pixels (x to the right, y downwards) --------
+# company  = issuername
+# max_rows = cards below each other before a group starts a second column
+org_layout <- function(company, max_rows = 4) {
+
+  d <- Iss_Gov_Dir_Gen %>% filter(issuername == company)
+  d <- d %>% filter(isin == d$isin[1])
+
+  col <- function(key) {                       # column as vector, NA if the column does not exist
+    v <- org_cols[[key]]
+    if (is.null(v) || is.na(v) || !v %in% names(d)) rep(NA, nrow(d)) else d[[v]]
+  }
+
+  nm <- as.character(col("name"))
+  if (all(is.na(nm))) nm <- trimws(paste(coalesce(as.character(col("first")), ""),
+                                         coalesce(as.character(col("last")), "")))
+  nm[is.na(nm) | nm == ""] <- paste("Director", seq_len(nrow(d)))[is.na(nm) | nm == ""]
+
+  code <- trimws(as.character(col("group")))
+  k    <- match(toupper(code), toupper(org_class$code))          # NA = code that is not in org_class
+
+  dir <- tibble(
+    name   = nm,
+    role   = as.character(col("role")),
+    group  = case_when(!is.na(k) ~ org_class$label[k], is.na(code) | code == "" ~ "Not classified", TRUE ~ code),
+    colour = coalesce(org_class$colour[k], "#7a7972"),
+    gorder = coalesce(as.numeric(k), 99),
+    age    = suppressWarnings(as.numeric(col("age"))),
+    gender = org_gender(col("gender")),
+    tenure = suppressWarnings(as.numeric(col("tenure")))
+  )
+  fl <- org_flags %>% filter(column %in% names(d))
+  dir$tags <- lapply(seq_len(nrow(d)), function(i)
+    fl[vapply(fl$column, function(v) org_yes(d[[v]][i]), logical(1)), ])
+
+  dir <- dir %>%
+    distinct(name, .keep_all = TRUE) %>%
+    mutate(lead = case_when(grepl("chair", role, ignore.case = TRUE) & !grepl("vice|deputy", role, ignore.case = TRUE) ~ 1,
+                            grepl("ceo|chief executive", role, ignore.case = TRUE) ~ 2,
+                            TRUE ~ 3)) %>%
+    arrange(gorder, group, lead, name)
+
+  fmt <- function(x, digits = 0) if (is.na(x) || is.nan(x)) "n/a" else format(round(x, digits), nsmall = digits)
+  node <- function(x, y, w, h, class, style, ...) {             # one box: centre x/y, size, html
+    html <- div(class = paste("org-node", class),
+                style = paste0("width:", w, "px;height:", h, "px;", style), ...)
+    tibble(x = x, y = y, w = w, h = h, html = as.character(html))
+  }
+
+  # sizes
+  W <- 250; G <- 10; P <- 10; GG <- 28          # card width, gap, panel padding, gap between groups
+  TOP_W <- 440; TOP_H <- 124; STEM <- 22; HEAD_H <- 40
+
+  # height of each card from its content
+  n_lines <- function(x, per_line) ifelse(is.na(x) | x == "", 0, pmin(2, ceiling(nchar(x) / per_line)))
+  dir$h <- 20 + n_lines(dir$name, 23) * 17 + n_lines(dir$role, 27) * 16 + 2 * (n_lines(dir$role, 27) > 0) +
+    15 * (!is.na(dir$age) | !is.na(dir$gender)) + 15 * (!is.na(dir$tenure)) + 4 +
+    vapply(dir$tags, function(t) if (nrow(t)) 4 + 20 * nrow(t) else 0, numeric(1))
+  dir$h <- pmax(dir$h, 56)
+
+  # groups from left to right
+  groups <- unique(dir$group)
+  g_n    <- vapply(groups, function(g) sum(dir$group == g), numeric(1))
+  g_cols <- ceiling(g_n / max_rows)
+  g_w    <- g_cols * W + (g_cols - 1) * G + 2 * P
+  total  <- max(sum(g_w) + (length(groups) - 1) * GG, TOP_W)
+  g_x    <- (total - (sum(g_w) + (length(groups) - 1) * GG)) / 2 + cumsum(c(0, head(g_w + GG, -1)))
+  bus_y  <- TOP_H + STEM
+  head_y <- bus_y + STEM
+  card_y <- head_y + HEAD_H + 10 + P
+
+  # company box
+  stat <- function(value, label) div(class = "org-stat", tags$b(value), span(label))
+  nodes <- node(total / 2, TOP_H / 2, TOP_W, TOP_H, "org-top", "",
+                div(class = "org-sub", "Board of Directors"), tags$h1(company),
+                div(class = "org-stats",
+                    stat(nrow(dir), "directors"),
+                    stat(if (all(is.na(dir$gender))) "n/a" else paste0(fmt(100 * mean(dir$gender == "Female", na.rm = TRUE)), "%"), "women"),
+                    stat(fmt(mean(dir$age, na.rm = TRUE)), "average age"),
+                    stat(fmt(mean(dir$tenure, na.rm = TRUE), 1), "average tenure (years)")))
+
+  panels <- NULL
+  lines  <- tibble(x1 = total / 2, y1 = TOP_H, x2 = total / 2, y2 = bus_y)                    # stem
+  if (length(groups) > 1)
+    lines <- bind_rows(lines, tibble(x1 = g_x[1] + g_w[1] / 2, y1 = bus_y,
+                                     x2 = g_x[length(groups)] + g_w[length(groups)] / 2, y2 = bus_y))   # bus
+
+  for (j in seq_along(groups)) {
+    idx  <- which(dir$group == groups[j])
+    colr <- dir$colour[idx[1]]
+    cx   <- g_x[j] + g_w[j] / 2
+    lines <- bind_rows(lines, tibble(x1 = cx, y1 = bus_y, x2 = cx, y2 = head_y))
+    nodes <- bind_rows(nodes, node(cx, head_y + HEAD_H / 2, g_w[j], HEAD_H, "org-head", paste0("background:", colr),
+                                   groups[j]))
+
+    # cards row by row; every card in a row gets the height of the tallest one
+    row_of <- (seq_along(idx) - 1) %/% g_cols[j]
+    col_of <- (seq_along(idx) - 1) %%  g_cols[j]
+    row_h  <- tapply(dir$h[idx], row_of, max)
+    row_y  <- card_y + cumsum(c(0, head(row_h + G, -1)))
+    for (i in seq_along(idx)) {
+      r    <- dir[idx[i], ]
+      h    <- row_h[[row_of[i] + 1]]
+      meta <- c(if (!is.na(r$age)) paste(fmt(r$age), "years"), if (!is.na(r$gender)) r$gender)
+      tags_i <- r$tags[[1]]
+      nodes <- bind_rows(nodes, node(
+        g_x[j] + P + col_of[i] * (W + G) + W / 2, row_y[row_of[i] + 1] + h / 2, W, h, "org-card",
+        paste0("border-left-color:", colr),
+        div(class = "org-av", style = paste0("background:", colr), org_initials(r$name)),
+        div(class = "org-txt",
+            div(class = "org-name", r$name),
+            if (!is.na(r$role) && r$role != "") div(class = "org-role", r$role),
+            if (length(meta)) div(class = "org-meta", style = "margin-top:4px", paste(meta, collapse = ", ")),
+            if (!is.na(r$tenure)) div(class = "org-meta", paste(fmt(r$tenure, if (r$tenure %% 1 == 0) 0 else 1), "years on board")),
+            if (nrow(tags_i)) div(style = "margin-top:4px", lapply(seq_len(nrow(tags_i)), function(t)
+              div(class = paste("org-tag", tags_i$type[t]), tags_i$label[t]))))))
+    }
+    panels <- bind_rows(panels, tibble(x1 = g_x[j], y1 = card_y - P, x2 = g_x[j] + g_w[j],
+                                       y2 = card_y + sum(row_h) + (length(row_h) - 1) * G + P))
+  }
+
+  list(nodes = nodes, panels = panels, lines = lines, width = total, height = max(panels$y2))
+}
+
+# ---- PLOT --------------------------------------------------------------------------
+plot_board_organigram <- function(company, max_rows = 4) {
+
+  L <- org_layout(company, max_rows)
+
+  # a plain flat canvas instead of a world map: 1 unit = 1 pixel at zoom 0, y goes down -> lat = -y
+  m <- leaflet(options = leafletOptions(crs = leafletCRS(crsClass = "L.CRS.Simple"),
+                                        minZoom = -3, maxZoom = 2, zoomSnap = 0.1, zoomDelta = 0.5,
+                                        zoomAnimation = FALSE, attributionControl = FALSE)) %>%
+    addRectangles(lng1 = L$panels$x1, lat1 = -L$panels$y1, lng2 = L$panels$x2, lat2 = -L$panels$y2,
+                  stroke = FALSE, fillColor = "#f0efec", fillOpacity = 1)
+
+  for (i in seq_len(nrow(L$lines)))
+    m <- m %>% addPolylines(lng = c(L$lines$x1[i], L$lines$x2[i]), lat = -c(L$lines$y1[i], L$lines$y2[i]),
+                            color = "#c3c2b7", weight = 2, opacity = 1)
+
+  m %>%
+    addLabelOnlyMarkers(lng = L$nodes$x, lat = -L$nodes$y, label = lapply(L$nodes$html, HTML),
+                        labelOptions = labelOptions(permanent = TRUE, direction = "center", textOnly = TRUE,
+                                                    className = "org-lbl", opacity = 1, sticky = FALSE)) %>%
+    fitBounds(lng1 = -20, lat1 = -(L$height + 20), lng2 = L$width + 20, lat2 = 20) %>%
+    htmlwidgets::prependContent(tags$style(HTML(org_css))) %>%
+    htmlwidgets::onRender("
+      function(el, x) {
+        var map = this;
+        function scale() { el.style.setProperty('--org-s', Math.pow(2, map.getZoom())); }
+        map.on('zoom zoomend viewreset', scale);
+        scale();
+      }")
+}
+
+plot_board_organigram("Microsoft Corporation")
+
+# save it as a file that opens in any browser:
+# htmlwidgets::saveWidget(plot_board_organigram("Microsoft Corporation"), "Organigram_Microsoft.html")
